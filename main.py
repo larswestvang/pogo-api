@@ -245,7 +245,7 @@ def v1_level(
     atkIV: int = Query(..., ge=0, le=15),
     defIV: int = Query(..., ge=0, le=15),
     staIV: int = Query(..., ge=0, le=15),
-    maxLevel: float = Query(51.0, ge=1.0, le=51.0),
+    maxLevel: float = Query(50.0, ge=1.0, le=51.0),
 ) -> Dict[str, Any]:
     sp = norm_species(species)
     base = BASE_STATS.get(sp)
@@ -272,19 +272,13 @@ def v1_pvp_rank(
     atkIV: int = Query(..., ge=0, le=15),
     defIV: int = Query(..., ge=0, le=15),
     staIV: int = Query(..., ge=0, le=15),
-    maxLevel: float = Query(51.0, ge=1.0, le=51.0),
+    maxLevel: float = Query(50.0, ge=1.0, le=51.0),
 ) -> Dict[str, Any]:
     sp = norm_species(species)
     lg = league.strip().lower()
 
     if lg not in ("great", "ultra", "master"):
         raise HTTPException(status_code=400, detail="league must be great|ultra|master")
-
-    if lg == "master":
-        # Master League is typically uncapped; "rank among 4096" isn't as meaningful.
-        # We can still compute "best level under cap" using a huge cap, but rank is mostly irrelevant.
-        # For now: return a clear error to avoid misleading results.
-        raise HTTPException(status_code=400, detail="master league is uncapped; pvp rank table is not supported in this endpoint")
 
     key = (sp, lg, float(maxLevel))
     if key not in PVP_RANKS:
