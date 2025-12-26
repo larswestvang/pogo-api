@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Environment variables / secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# VS Code
+.vscode/
+
+# Docker
+*.log
+
+# Build / cache artifacts
+dist/
+build/
