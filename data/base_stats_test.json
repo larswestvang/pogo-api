@@ -1,0 +1,22 @@
+{
+  "abomasnow": {
+    "templateId": "V0460_POKEMON_ABOMASNOW_NORMAL",
+    "pokemonId": "abomasnow",
+    "form": "abomasnow_normal",
+    "stats": {
+      "atk": 178,
+      "def": 158,
+      "sta": 207
+    }
+  },
+  "abra": {
+    "templateId": "V0063_POKEMON_ABRA_NORMAL",
+    "pokemonId": "abra",
+    "form": "abra_normal",
+    "stats": {
+      "atk": 195,
+      "def": 82,
+      "sta": 93
+    }
+  }
+}
