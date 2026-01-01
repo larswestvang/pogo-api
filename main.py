@@ -6,6 +6,10 @@ import os
 from dataclasses import dataclass
 from typing import Dict, Tuple, Any, Optional
 
+from collections import OrderedDict
+from threading import RLock
+from bisect import bisect_right
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi import Depends, Header
 
@@ -40,6 +44,11 @@ BASE_STATS: Dict[str, BaseStats] = {}
 # PVP_RANKS[(species, league, maxLevel)] = dict[(atkIV,defIV,staIV)] -> payload
 PVP_RANKS: Dict[Tuple[str, str, float], Dict[Tuple[int, int, int], Dict[str, Any]]] = {}
 
+# cache key: (species, league, maxLevel)
+# value: sorted ascending list of statProducts for all 4096 IVs
+PVP_DIST_CACHE: "OrderedDict[tuple, list[float]]" = OrderedDict()
+PVP_CACHE_LOCK = RLock()
+PVP_CACHE_MAX_ENTRIES = 64  # tune for your use
 
 @dataclass(frozen=True)
 class BaseStats:
@@ -125,55 +134,49 @@ def get_levels(max_level: float) -> Tuple[float, ...]:
     return LEVELS_BY_MAX[max_level]
 
 
-def precompute_pvp_ranks(species: str, league: str, max_level: float) -> None:
+def get_or_build_pvp_distribution(species: str, league: str, max_level: float) -> list[float]:
     key = (species, league, max_level)
-    if key in PVP_RANKS:
-        return
 
-    if league not in LEAGUE_CAPS:
-        raise ValueError("unknown league")
+    with PVP_CACHE_LOCK:
+        cached = PVP_DIST_CACHE.get(key)
+        if cached is not None:
+            # refresh LRU position
+            PVP_DIST_CACHE.move_to_end(key)
+            return cached
 
+    # Build outside lock to avoid blocking other requests too long
     cap = LEAGUE_CAPS[league]
-    base = BASE_STATS.get(species)
-    if base is None:
-        raise ValueError("unknown species")
-
+    base = BASE_STATS[species]
     levels = get_levels(max_level)
 
-    rows = []
-    # Compute best stat product under cap for all 4096 IV combos
+    dist: list[float] = []
+    append = dist.append
+
     for a in range(16):
         for d in range(16):
             for s in range(16):
                 best_lvl, best_cp, best_sp = best_level_under_cap(
                     base, a, d, s, cap, levels, CPM_BY_LEVEL
                 )
-                rows.append(((a, d, s), best_sp, best_lvl, best_cp))
+                append(best_sp)
 
-    # Sort by stat product descending; apply stable tiebreakers if desired
-    rows.sort(key=lambda x: (x[1],), reverse=True)
+    dist.sort()  # ascending
 
-    rank_map: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-    out_of = len(rows)
+    with PVP_CACHE_LOCK:
+        PVP_DIST_CACHE[key] = dist
+        PVP_DIST_CACHE.move_to_end(key)
 
-    # Handle ties: same stat product -> same rank, or dense ranking?
-    # We'll do "competition ranking": 1,2,2,4...
-    current_rank = 0
-    last_sp: Optional[float] = None
-    for idx, (ivs, sp, lvl, cp) in enumerate(rows, start=1):
-        if last_sp is None or sp != last_sp:
-            current_rank = idx
-            last_sp = sp
+        # enforce LRU size cap
+        while len(PVP_DIST_CACHE) > PVP_CACHE_MAX_ENTRIES:
+            PVP_DIST_CACHE.popitem(last=False)
 
-        rank_map[ivs] = {
-            "rank": current_rank,
-            "outOf": out_of,
-            "level": lvl,
-            "cp": cp,
-            "statProduct": sp,
-        }
+    return dist
 
-    PVP_RANKS[key] = rank_map
+
+def rank_from_distribution(dist: list[float], sp: float) -> int:
+    higher = len(dist) - bisect_right(dist, sp)
+    return 1 + higher
+
 
 
 app = FastAPI(title="Pokémon GO Sheet API", version="1.0.0", redirect_slashes=False)
@@ -282,21 +285,56 @@ def v1_pvp_rank(
     if lg not in ("great", "ultra"):
         raise HTTPException(status_code=400, detail="league must be great|ultra")
 
-    key = (sp, lg, float(maxLevel))
-    if key not in PVP_RANKS:
-        # compute on demand (e.g. if you change maxLevel)
-        if sp not in BASE_STATS:
-            raise HTTPException(status_code=404, detail=f"Unknown species '{species}'")
+#    key = (sp, lg, float(maxLevel))
+#    if key not in PVP_RANKS:
+#        # compute on demand (e.g. if you change maxLevel)
+#        if sp not in BASE_STATS:
+#            raise HTTPException(status_code=404, detail=f"Unknown species '{species}'")
+#
+#    table = PVP_RANKS[key]
+#    payload = table.get((atk_iv, def_iv, sta_iv))
+#    if payload is None:
+#        raise HTTPException(status_code=500, detail="rank lookup failed unexpectedly")
+#
+#    return {
+#        "species": sp,
+#        "league": lg,
+#        "maxLevel": float(maxLevel),
+#        "ivs": {"atkIV": atk_iv, "defIV": def_iv, "staIV": sta_iv},
+#        **payload,
+#    }
 
-    table = PVP_RANKS[key]
-    payload = table.get((atk_iv, def_iv, sta_iv))
-    if payload is None:
-        raise HTTPException(status_code=500, detail="rank lookup failed unexpectedly")
+    base = BASE_STATS.get(sp)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"Unknown species '{species}'")
+
+    cap = LEAGUE_CAPS[lg]
+    levels = get_levels(float(maxLevel))
+
+    # 1) compute best level+cp+stat product for requested IVs
+    best_lvl, best_cp, best_sp = best_level_under_cap(
+        base, atk_iv, def_iv, sta_iv, cap, levels, CPM_BY_LEVEL
+    )
+
+    # 2) get cached distribution (build once per species/league/maxLevel)
+    dist = get_or_build_pvp_distribution(sp, lg, float(maxLevel))
+
+    # 3) compute rank from distribution
+    rank = rank_from_distribution(dist, best_sp)
 
     return {
         "species": sp,
         "league": lg,
         "maxLevel": float(maxLevel),
         "ivs": {"atkIV": atk_iv, "defIV": def_iv, "staIV": sta_iv},
-        **payload,
+        "rank": rank,
+        "outOf": 4096,
+        "level": best_lvl,
+        "cp": best_cp,
+        "statProduct": best_sp,
+        "cache": {
+            "entries": len(PVP_DIST_CACHE),
+            "maxEntries": PVP_CACHE_MAX_ENTRIES,
+            "keyCached": True,  # this request will always end cached after building
+        },
     }
