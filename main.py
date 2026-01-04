@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-import json
-import math
 import os
-from dataclasses import dataclass
-from typing import Dict, Tuple, Any, Optional
+import math
+import json
 
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any, Optional
 from collections import OrderedDict
+
 from threading import RLock
 from bisect import bisect_right
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi import Depends, Header
+from fastapi import FastAPI, Depends, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
+
+import google.auth
+from googleapiclient.discovery import build
+
 
 API_KEY_ENV = "POGO_API_KEY"
 
-def require_api_key(x_api_key: str = Header(None)) -> None:
+def _require_api_key(x_api_key: str = Header(None)) -> None:
     expected = os.environ.get(API_KEY_ENV)
 
     if not expected:
@@ -34,15 +39,19 @@ LEAGUE_CAPS = {
     "ultra": 2500,
 }
 
+MIN_LEVEL = None  # to be set at startup
 MAX_LEVEL = None  # to be set at startup
 LEVEL_STEP = 0.5
+
+
+#CASE_INSENSITIVE = os.environ.get("CASE_INSENSITIVE", "true").lower() == "true"
+#TRIM_WHITESPACE = os.environ.get("TRIM_WHITESPACE", "true").lower() == "true"
+
 
 # In-memory caches
 CPM_BY_LEVEL: Dict[str, float] = {}
 LEVELS_BY_MAX: Dict[float, Tuple[float, ...]] = {}  # cache computed level lists
 BASE_STATS: Dict[str, BaseStats] = {}
-# PVP_RANKS[(species, league, maxLevel)] = dict[(atkIV,defIV,staIV)] -> payload
-PVP_RANKS: Dict[Tuple[str, str, float], Dict[Tuple[int, int, int], Dict[str, Any]]] = {}
 
 # cache key: (species, league, maxLevel)
 # value: sorted ascending list of statProducts for all 4096 IVs
@@ -57,16 +66,29 @@ class BaseStats:
     stamina: int
 
 
-def norm_species(name: str) -> str:
-    return "".join(ch.lower() for ch in name.strip() if ch.isalnum())
+# Pokemon Google Sheet Config
+SHEET_ID = "1Wq4RvuOKPPedxQZxf9vqcCUghh3KVdZskICFThLY0PI" #os.environ.get("SHEET_ID", "")
+SHEET_RANGE = "gl-roster!A:D" #os.environ.get("SHEET_RANGE", "Sheet1!A:D")  # set to your tab name
+
+credentials, _ = google.auth.default(
+    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+)
+sheets = build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
 
-def load_json(path: str) -> Any:
+# Normalize names for consistent lookup
+def _norm(name: str) -> str:
+    return "".join(ch.casefold() for ch in name.strip() if ch.isalnum())
+
+
+# Load JSON file
+def _load_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def calc_cp(base: BaseStats, atk_iv: int, def_iv: int, sta_iv: int, cpm: float) -> int:
+# Calculate CP (Combat Power) from base stats, IVs, and CPM
+def _calc_cp(base: BaseStats, atk_iv: int, def_iv: int, sta_iv: int, cpm: float) -> int:
     a = (base.attack + atk_iv)
     d = (base.defense + def_iv)
     s = (base.stamina + sta_iv)
@@ -75,18 +97,21 @@ def calc_cp(base: BaseStats, atk_iv: int, def_iv: int, sta_iv: int, cpm: float) 
     return max(10, cp)
 
 
-def calc_stats_at_level(base: BaseStats, atk_iv: int, def_iv: int, sta_iv: int, cpm: float) -> Tuple[float, float, int]:
+# Calculate actual stats (attack, defense, stamina) at given level
+def _calc_stats_at_level(base: BaseStats, atk_iv: int, def_iv: int, sta_iv: int, cpm: float) -> Tuple[float, float, int]:
     a = (base.attack + atk_iv) * cpm
     d = (base.defense + def_iv) * cpm
     s = math.floor((base.stamina  + sta_iv) * cpm)
     return a, d, s
 
 
-def stat_product(attack: float, defense: float, stamina: int) -> float:
+# Return the stat product (attack * defense * stamina)
+def _stat_product(attack: float, defense: float, stamina: int) -> float:
     return attack * defense * stamina
 
 
-def best_level_under_cap(
+# Find the best level under a given CP cap for Pokemon's specific base stats and IVs
+def _best_level_under_cap(
     base: BaseStats,
     atk_iv: int,
     def_iv: int,
@@ -96,7 +121,7 @@ def best_level_under_cap(
     cpm_by_level: Dict[str, float],
 ) -> Tuple[float, int, float]:
     """
-    Returns (best_level, best_cp, best_stat_product)
+    Returns (best_lvl, best_cp, best_sp (stat product))
     """
     best_lvl = levels[0]
     best_cp = 10
@@ -104,10 +129,10 @@ def best_level_under_cap(
 
     for lvl in levels:
         cpm = cpm_by_level[f"{lvl:.1f}"]
-        cp = calc_cp(base, atk_iv, def_iv, sta_iv, cpm)
+        cp = _calc_cp(base, atk_iv, def_iv, sta_iv, cpm)
         if cp <= cap:
-            a, d, s = calc_stats_at_level(base, atk_iv, def_iv, sta_iv, cpm)
-            sp = stat_product(a, d, s)
+            a, d, s = _calc_stats_at_level(base, atk_iv, def_iv, sta_iv, cpm)
+            sp = _stat_product(a, d, s)
             best_lvl, best_cp, best_sp = lvl, cp, sp
         else:
             # levels increase monotonically in CP for fixed IVs, so we can break early
@@ -117,7 +142,7 @@ def best_level_under_cap(
 
 
 # Build levels list for given max_level
-def build_levels(cpm: Dict[str, float], max_level: float) -> Tuple[float, ...]:
+def _build_levels(cpm: Dict[str, float], max_level: float) -> Tuple[float, ...]:
     levels = []
     lvl = 1.0
     while lvl <= max_level + 1e-9:
@@ -128,13 +153,16 @@ def build_levels(cpm: Dict[str, float], max_level: float) -> Tuple[float, ...]:
     return tuple(levels)
 
 
-def get_levels(max_level: float) -> Tuple[float, ...]:
+# Get or build levels list for given max_level
+# Todo: combine with build_levels?
+def _get_levels(max_level: float) -> Tuple[float, ...]:
     if max_level not in LEVELS_BY_MAX:
-        LEVELS_BY_MAX[max_level] = build_levels(CPM_BY_LEVEL, max_level=max_level)
+        LEVELS_BY_MAX[max_level] = _build_levels(CPM_BY_LEVEL, max_level=max_level)
     return LEVELS_BY_MAX[max_level]
 
 
-def get_or_build_pvp_distribution(species: str, league: str, max_level: float) -> list[float]:
+# Get or build PvP stat product distribution for given species, league, and max_level
+def _get_pvp_distribution(species: str, league: str, max_level: float) -> list[float]:
     key = (species, league, max_level)
 
     with PVP_CACHE_LOCK:
@@ -147,7 +175,7 @@ def get_or_build_pvp_distribution(species: str, league: str, max_level: float) -
     # Build outside lock to avoid blocking other requests too long
     cap = LEAGUE_CAPS[league]
     base = BASE_STATS[species]
-    levels = get_levels(max_level)
+    levels = _get_levels(max_level)
 
     dist: list[float] = []
     append = dist.append
@@ -155,7 +183,7 @@ def get_or_build_pvp_distribution(species: str, league: str, max_level: float) -
     for a in range(16):
         for d in range(16):
             for s in range(16):
-                best_lvl, best_cp, best_sp = best_level_under_cap(
+                best_lvl, best_cp, best_sp = _best_level_under_cap(
                     base, a, d, s, cap, levels, CPM_BY_LEVEL
                 )
                 append(best_sp)
@@ -173,44 +201,31 @@ def get_or_build_pvp_distribution(species: str, league: str, max_level: float) -
     return dist
 
 
-def rank_from_distribution(dist: list[float], sp: float) -> int:
+def _rank_from_distribution(dist: list[float], sp: float) -> int:
     higher = len(dist) - bisect_right(dist, sp)
     return 1 + higher
-
 
 
 app = FastAPI(title="Pokémon GO Sheet API", version="1.0.0", redirect_slashes=False)
 
 @app.on_event("startup")
 def startup_load_and_precompute() -> None:
-    global MAX_LEVEL, CPM_BY_LEVEL, BASE_STATS
+    global MIN_LEVEL, MAX_LEVEL, CPM_BY_LEVEL, BASE_STATS
 
     # Read CPM data and build a levels list
     cpm_path = os.path.join(DATA_DIR, "cpm.json")
-    raw_cpm = load_json(cpm_path)
+    raw_cpm = _load_json(cpm_path)
     CPM_BY_LEVEL = {str(k): float(v) for k, v in raw_cpm.items()}
-    print(f"[INFO] Loaded {len(CPM_BY_LEVEL)} CPM entries, from level {min(CPM_BY_LEVEL)}) to {max(CPM_BY_LEVEL)}")
-
+    MIN_LEVEL = min(map(float, CPM_BY_LEVEL), default=None)
     MAX_LEVEL = max(map(float, CPM_BY_LEVEL), default=None)
-    # LEVELS_BY_MAX[MAX_LEVEL] = build_levels(CPM_BY_LEVEL, float(MAX_LEVEL))
 
     # Read base stats data
     base_path = os.path.join(DATA_DIR, "base_stats.json")
-    raw_base = load_json(base_path)
+    raw_base = _load_json(base_path)
     BASE_STATS = {
-        norm_species(k): BaseStats(attack=int(v["stats"]["atk"]), defense=int(v["stats"]["def"]), stamina=int(v["stats"]["sta"]))
+        _norm(k): BaseStats(attack=int(v["stats"]["atk"]), defense=int(v["stats"]["def"]), stamina=int(v["stats"]["sta"]))
         for k, v in raw_base.items()
     }
-    print(f"[INFO] Loaded base stats for {len(BASE_STATS)} species")
-
-    # Precompute ranks for great/ultra by default at maxLevel=50
-    # print(f"[INFO] Precomputing PvP ranks for all species in great/ultra leagues at maxLevel=50", flush=True)
-    # precompute_species = list(BASE_STATS.keys())
-    # for species in precompute_species:
-    #     for league in ("great", "ultra"):
-    #         precompute_pvp_ranks(species, league, max_level=50.0)
-    #        #write_pvp_ranks_json("data/pvp_ranks.json")
-    # print(f"[INFO] Precomputed PvP ranks for {len(precompute_species)} species", flush=True)
 
 
 @app.get("/health")
@@ -219,7 +234,7 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/v1/level", dependencies=[Depends(require_api_key)])
+@app.get("/v1/level", dependencies=[Depends(_require_api_key)])
 def v1_level(
     species: str = Query(..., description="Pokémon species name, e.g. Azumarill"),
     target_cp: int = Query(..., ge=10, description="Observed CP"),
@@ -227,7 +242,7 @@ def v1_level(
     def_iv: int = Query(..., ge=0, le=15),
     sta_iv: int = Query(..., ge=0, le=15),
 ) -> Dict[str, Any]:
-    sp = norm_species(species)
+    sp = _norm(species)
     base = BASE_STATS.get(sp)
     if base is None:
         raise HTTPException(status_code=404, detail=f"Unknown species '{species}'")
@@ -245,7 +260,7 @@ def v1_level(
             lvl += 0.5
             continue
 
-        computed = calc_cp(base, atk_iv, def_iv, sta_iv, cpm)
+        computed = _calc_cp(base, atk_iv, def_iv, sta_iv, cpm)
         diff = abs(computed - target_cp)
 
         if best is None or diff < best[0]:
@@ -270,7 +285,7 @@ def v1_level(
     }
 
 
-@app.get("/v1/pvp-rank", dependencies=[Depends(require_api_key)])
+@app.get("/v1/pvp-rank", dependencies=[Depends(_require_api_key)])
 def v1_pvp_rank(
     species: str = Query(...),
     league: str = Query(..., description="great|ultra"),
@@ -279,48 +294,29 @@ def v1_pvp_rank(
     sta_iv: int = Query(..., ge=0, le=15),
     maxLevel: float = Query(50.0, ge=1.0, le=51.0),
 ) -> Dict[str, Any]:
-    sp = norm_species(species)
+    sp = _norm(species)
     lg = league.strip().lower()
 
     if lg not in ("great", "ultra"):
         raise HTTPException(status_code=400, detail="league must be great|ultra")
-
-#    key = (sp, lg, float(maxLevel))
-#    if key not in PVP_RANKS:
-#        # compute on demand (e.g. if you change maxLevel)
-#        if sp not in BASE_STATS:
-#            raise HTTPException(status_code=404, detail=f"Unknown species '{species}'")
-#
-#    table = PVP_RANKS[key]
-#    payload = table.get((atk_iv, def_iv, sta_iv))
-#    if payload is None:
-#        raise HTTPException(status_code=500, detail="rank lookup failed unexpectedly")
-#
-#    return {
-#        "species": sp,
-#        "league": lg,
-#        "maxLevel": float(maxLevel),
-#        "ivs": {"atkIV": atk_iv, "defIV": def_iv, "staIV": sta_iv},
-#        **payload,
-#    }
 
     base = BASE_STATS.get(sp)
     if base is None:
         raise HTTPException(status_code=404, detail=f"Unknown species '{species}'")
 
     cap = LEAGUE_CAPS[lg]
-    levels = get_levels(float(maxLevel))
+    levels = _get_levels(float(maxLevel))
 
     # 1) compute best level+cp+stat product for requested IVs
-    best_lvl, best_cp, best_sp = best_level_under_cap(
+    best_lvl, best_cp, best_sp = _best_level_under_cap(
         base, atk_iv, def_iv, sta_iv, cap, levels, CPM_BY_LEVEL
     )
 
     # 2) get cached distribution (build once per species/league/maxLevel)
-    dist = get_or_build_pvp_distribution(sp, lg, float(maxLevel))
+    dist = _get_pvp_distribution(sp, lg, float(maxLevel))
 
     # 3) compute rank from distribution
-    rank = rank_from_distribution(dist, best_sp)
+    rank = _rank_from_distribution(dist, best_sp)
 
     return {
         "species": sp,
@@ -337,4 +333,52 @@ def v1_pvp_rank(
             "maxEntries": PVP_CACHE_MAX_ENTRIES,
             "keyCached": True,  # this request will always end cached after building
         },
+    }
+
+
+def _rows_to_dicts(values: List[List[str]]) -> List[Dict[str, str]]:
+    """Convert Sheets grid to list of dicts using first row as headers."""
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    out: List[Dict[str, str]] = []
+    for row in values[1:]:
+        obj = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
+        out.append(obj)
+    return out
+
+
+@app.get("/v1/pvp-gl-roster", dependencies=[Depends(_require_api_key)])
+def v1_pvp_gl_roster(
+    # Using dynamic lookup key is awkward in FastAPI typing; we accept `value`
+    # and interpret it as the value for LOOKUP_KEY (default "Name").
+    # value: str = Query(..., description="Lookup value (defaults to Pokemon Name)"),
+):
+    if not SHEET_ID:
+        raise HTTPException(status_code=500, detail="SHEET_ID env var is not set")
+
+    try:
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=SHEET_RANGE,
+        ).execute()
+    except Exception as e:
+        # 502 to indicate upstream/Google API issue
+        raise HTTPException(status_code=502, detail=f"failed to read sheet: {e}")
+
+    values = resp.get("values", [])
+    records = _rows_to_dicts(values)
+
+    # Return only the PvP-relevant columns, explicitly ordered
+    return {
+        "count": len(records),
+        "pokemon": [
+            {
+                "Name": r.get("Name", ""),
+                "Fast Move": r.get("Fast Move", ""),
+                "1st Charged Move": r.get("1st Charged Move", ""),
+                "2nd Charged Move": r.get("2nd Charged Move", ""),
+            }
+            for r in records
+        ],
     }
